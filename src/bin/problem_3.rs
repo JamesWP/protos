@@ -72,6 +72,7 @@ impl Connections {
                 if *connection_addr == addr {
                     continue;
                 }
+
             }
 
             match Self::send_to_connection(&mut connection.connection, name, message, is_server) {
@@ -131,17 +132,19 @@ fn handle_thread(mut stream: std::net::TcpStream, con_man: ConMan) -> std::io::R
 
     let name = buffer.trim();
 
-    stream.write_all("[SERVER] Welcome [".as_bytes())?;
-    stream.write_all(name.as_bytes())?;
-    stream.write_all("]\n".as_bytes())?;
+    if !name.chars().all(char::is_alphanumeric) {
+        stream.write_all("Name must only contain alphanumeric characters\n".as_bytes())?;
+        return Err(ErrorKind::BrokenPipe.into());
+    }
 
     let writer = stream.try_clone().unwrap();
     con_man.lock().unwrap().user_joined(name, writer)?;
 
     let mut buffer = String::new();
     loop {
-        let message_len = buf_reader.read_line(&mut buffer)?;
+        buffer.clear();
 
+        let message_len = buf_reader.read_line(&mut buffer)?;
         if message_len == 0 {
             return Err(ErrorKind::BrokenPipe.into());
         }
