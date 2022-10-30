@@ -1,6 +1,6 @@
 use std::{
-    io::{Read, Write, BufRead},
-    net::{Incoming, SocketAddr}, sync::{Arc, Mutex}, collections::{HashMap, hash_map::Entry::{Occupied, Vacant}},
+    io::{Read, Write, BufRead, ErrorKind},
+    net::{Incoming, SocketAddr, SocketAddrV4, Ipv4Addr}, sync::{Arc, Mutex}, collections::{HashMap, hash_map::Entry::{Occupied, Vacant}},
 };
 struct Connection {
     name: String,
@@ -23,6 +23,11 @@ impl Connections {
         stream.write_all(user_list.as_bytes())?;
         stream.write_all(".\n".as_bytes())?;
 
+        let user_joined_message = format!("User joined the room [{}]", name);
+        let is_server = true;
+
+        self.send_to_all(None, Some(addr), &user_joined_message, is_server);
+
         match self.connections.entry(addr) {
             Occupied(_) => {
                 todo!("Socket addresses can be reused, previous user has been disconnected")
@@ -36,8 +41,70 @@ impl Connections {
     }
 
     fn user_disconnected(&mut self, peer_addr: SocketAddr) {
-        println!("Socket disconnected {}", peer_addr);
-        self.connections.remove(&peer_addr); 
+        let name = match self.connections.entry(peer_addr) {
+            Occupied(e) => {
+                let name = e.get().name.clone();
+                e.get().connection.shutdown(std::net::Shutdown::Both).expect("Shutdown not to fail");
+                e.remove();
+                name
+            },
+            Vacant(_) => {
+                // User already disconnected
+                return;
+            },
+        };
+
+        println!("Socket disconnected {} [{}]", peer_addr, name);
+
+        let is_server = true;
+        let message = format!("User left the room [{}]", name);
+
+        self.send_to_all(None, None, &message, is_server);
+    }
+
+    fn send_to_all(&mut self, name: Option<&str>, addr: Option<SocketAddr>, message: &str, is_server: bool) {
+        let mut dead_peers = vec![];
+
+        println!("User {:?} send message: {}", name, message);
+
+        for (connection_addr, connection) in self.connections.iter_mut() {
+            if let Some(addr) = addr{
+                if *connection_addr == addr {
+                    continue;
+                }
+            }
+
+            match Self::send_to_connection(&mut connection.connection, name, message, is_server) {
+                Ok(_) => {},
+                Err(_) => {
+                    // Error writing to this connection, disconnect them
+                    dead_peers.push(*connection_addr);
+                }
+            };
+        }
+        
+        // Disconnect dead peers
+        for peer in dead_peers {
+            println!("Unable to write to {}, disconnecting", peer);
+            self.user_disconnected(peer);
+        }
+    }
+    
+    fn send_to_connection(connection: &mut std::net::TcpStream, name: Option<&str>, message: &str, is_server: bool)-> std::io::Result<()> {
+        if is_server {
+            connection.write_all("* ".as_bytes())?;
+        }
+
+        if let Some(name) = name {
+            connection.write_all("[".as_bytes())?;
+            connection.write_all(name.as_bytes())?;
+            connection.write_all("] ".as_bytes())?;
+        }
+
+        connection.write_all(message.as_bytes())?;
+        connection.write_all("\n".as_bytes())?;
+
+        Ok(())
     }
 }
 
@@ -50,11 +117,17 @@ impl Default for Connections {
 type ConMan = Arc<Mutex<Connections>>;
 
 fn handle_thread(mut stream: std::net::TcpStream, con_man: ConMan) -> std::io::Result<()> {
+    let addr = stream.peer_addr().unwrap();
+
     let mut buf_reader = std::io::BufReader::new(stream.try_clone().unwrap());
 
     stream.write_all("[SERVER] Please enter a name:\n".as_bytes())?;
     let mut buffer = String::new();
-    buf_reader.read_line(&mut buffer)?;
+    let name_length = buf_reader.read_line(&mut buffer)?;
+
+    if name_length == 0 {
+        return Err(ErrorKind::BrokenPipe.into());
+    }
 
     let name = buffer.trim();
 
@@ -65,7 +138,18 @@ fn handle_thread(mut stream: std::net::TcpStream, con_man: ConMan) -> std::io::R
     let writer = stream.try_clone().unwrap();
     con_man.lock().unwrap().user_joined(name, writer)?;
 
-    Ok(())
+    let mut buffer = String::new();
+    loop {
+        let message_len = buf_reader.read_line(&mut buffer)?;
+
+        if message_len == 0 {
+            return Err(ErrorKind::BrokenPipe.into());
+        }
+
+        let message = buffer.trim();
+
+        con_man.lock().unwrap().send_to_all(Some(name), Some(addr), message, false);
+    }
 }
 
 fn main() -> std::io::Result<()> {
