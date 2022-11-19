@@ -1,6 +1,5 @@
 use std::{
     io::{Read, Write},
-    net::Incoming,
 };
 
 fn handle_thread(mut stream: std::net::TcpStream) -> std::io::Result<()> {

@@ -1,6 +1,6 @@
 use std::{
-    io::{Read, Write, BufRead, ErrorKind},
-    net::{Incoming, SocketAddr, SocketAddrV4, Ipv4Addr}, sync::{Arc, Mutex}, collections::{HashMap, hash_map::Entry::{Occupied, Vacant}},
+    io::{Write, BufRead, ErrorKind},
+    net::{SocketAddr}, sync::{Arc, Mutex}, collections::{HashMap, hash_map::Entry::{Occupied, Vacant}},
 };
 struct Connection {
     name: String,
