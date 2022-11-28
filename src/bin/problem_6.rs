@@ -1,9 +1,11 @@
 use std::{
     collections::{
         hash_map::Entry::{Occupied, Vacant},
-        HashMap, HashSet, BTreeMap,
+        BTreeMap, HashMap, HashSet,
     },
-    rc::Rc, hash::Hash,
+    hash::Hash,
+    rc::Rc,
+    sync::Mutex,
 };
 
 #[tokio::main]
@@ -13,7 +15,7 @@ async fn main() -> std::io::Result<()> {
     Ok(())
 }
 struct Car {
-    days_with_ticket: HashSet<u32>,
+    days_with_ticket: Mutex<HashSet<u32>>,
     plate: String,
 }
 
@@ -23,12 +25,18 @@ impl PartialEq for Car {
     }
 }
 
+fn timestamp_to_day(timestamp: u32) -> u32{
+    ((timestamp as f64) / 86400.0).floor() as u32
+}
+
 impl Car {
     pub fn has_ticket_on_day(&self, timestamp: u32) -> bool {
-        todo!();
+        let day = timestamp_to_day(timestamp);
+        self.days_with_ticket.lock().unwrap().contains(&day)
     }
-    pub fn give_ticket_for_day(&mut self, timestamp: u32) -> bool {
-        todo!();
+    pub fn give_ticket_for_day(&self, timestamp: u32) {
+        let day = timestamp_to_day(timestamp);
+        self.days_with_ticket.lock().unwrap().insert(day);
     }
     pub fn plate(&self) -> &str {
         &self.plate
@@ -110,14 +118,13 @@ trait Dispatcher {
     fn id(&self) -> Self::UniqueId;
 }
 
-
 struct RoadMonitor<D: Dispatcher> {
     road_id: u16,
-    pending_tickets: Vec<Ticket>,
-    dispatchers: HashMap<D::UniqueId, Rc<D>>,
+    pending_tickets: Mutex<Vec<Ticket>>,
+    dispatchers: Mutex<HashMap<D::UniqueId, Rc<D>>>,
 
     // Car -> Timestamp -> Location on road
-    observations: HashMap<String, BTreeMap<u32, u16>>,
+    observations: Mutex<HashMap<String, BTreeMap<u32, u16>>>,
 }
 
 impl<D: Dispatcher> From<u16> for RoadMonitor<D> {
@@ -132,13 +139,13 @@ impl<D: Dispatcher> From<u16> for RoadMonitor<D> {
 }
 
 impl<D: Dispatcher> RoadMonitor<D> {
-    fn record_observation(&mut self, car: Rc<Car>, mile: u16, time: u32, limit: u16) {
-        match self.observations.entry(car.plate.clone()) {
-            Occupied(o) => {},
-            Vacant(v) => {v.insert(Default::default());},
-        };
+    fn record_observation(&self, car: Rc<Car>, mile: u16, time: u32, limit: u16) {
+        let mut observations_locked = self.observations.lock().unwrap();
 
-        let location_map = self.observations.get_mut(car.plate().clone()).expect("map must be present now");
+        let location_map = match observations_locked.entry(car.plate.clone()) {
+            Occupied(o) => o.into_mut(),
+            Vacant(v) => v.insert(Default::default()),
+        };
 
         location_map.insert(time, mile);
 
@@ -146,31 +153,46 @@ impl<D: Dispatcher> RoadMonitor<D> {
 
         for ((prev_time, prev_mile), (next_time, next_mile)) in parwise {
             let speed = speed(*prev_time, *prev_mile, *next_time, *next_mile);
-            if speed > 100 * limit {
-                if let Some(dispatcher) = self.dispatchers.values().nth(0) {
-                    dispatcher.send_ticket(Ticket {
-                        car: car.clone(),
-                        road_id: self.road_id,
-                        mile1: *prev_mile,
-                        timestamp1: *prev_time,
-                        mile2: *next_mile,
-                        timestamp2: *next_time,
-                    });
+            if speed > 100 * limit && !(car.has_ticket_on_day(*prev_time) || car.has_ticket_on_day(*next_time)){
+                let ticket = Ticket {
+                    car: car.clone(),
+                    road_id: self.road_id,
+                    mile1: *prev_mile,
+                    timestamp1: *prev_time,
+                    mile2: *next_mile,
+                    timestamp2: *next_time,
+                };
+                
+                car.give_ticket_for_day(*prev_time);
+                car.give_ticket_for_day(*next_time);
+                if let Some(dispatcher) = self.dispatchers.lock().unwrap().values().nth(0) {
+                    dispatcher.send_ticket(ticket);
+                } else {
+                    self.pending_tickets.lock().unwrap().push(ticket);
                 }
             }
         }
     }
 
-    fn add_ticket_dispatcher(&mut self, d: Rc<D>) {
-        match self.dispatchers.entry(d.id()) {
+    fn add_ticket_dispatcher(&self, d: Rc<D>) {
+        match self.dispatchers.lock().unwrap().entry(d.id()) {
             Occupied(_) => todo!(),
             Vacant(v) => {
                 v.insert(d.clone());
-            },
+            }
         }
+
+        for ticket in self.pending_tickets.lock().unwrap().drain(..) {
+            d.send_ticket(ticket);
+        };
     }
-    fn remove_ticket_dispatcher(&mut self, d: &D) {
-        todo!();
+    fn remove_ticket_dispatcher(&self, d: &D) {
+        match self.dispatchers.lock().unwrap().entry(d.id()) {
+            Occupied(o) => {
+                o.remove();
+            }
+            Vacant(_) => todo!(),
+        }
     }
 }
 
@@ -180,7 +202,10 @@ struct RoadNetwork<D: Dispatcher> {
 
 impl<D: Dispatcher> RoadNetwork<D> {
     fn get_road_monitor(&mut self, road_id: u16) -> Rc<RoadMonitor<D>> {
-        todo!();
+        match self.road_monitors.entry(road_id) {
+            Occupied(o) => o.get().clone(),
+            Vacant(v) => v.insert(Rc::new(RoadMonitor::from(road_id))).clone(),
+        }
     }
 }
 struct Camera<D: Dispatcher> {
@@ -191,15 +216,16 @@ struct Camera<D: Dispatcher> {
 
 impl<D: Dispatcher> Camera<D> {
     fn observation(&mut self, car: Rc<Car>, time: u32) {
-        todo!();
+        self.road_monitor
+            .record_observation(car, self.mile, time, self.speed_limit);
     }
 }
 
 #[cfg(test)]
 mod test {
-    use std::{rc::Rc, cell::RefCell};
+    use std::{cell::RefCell, rc::Rc};
 
-    use crate::{Car, CarRegistry, Dispatcher, RoadMonitor, Ticket};
+    use crate::{Camera, Car, CarRegistry, Dispatcher, RoadMonitor, Ticket};
 
     #[test]
     fn test_car_registry() {
@@ -245,6 +271,10 @@ mod test {
         fn has_ticket(&self, ticket: &Ticket) -> bool {
             self.tickets.borrow().contains(ticket)
         }
+
+        fn count_tickets(&self) -> usize  {
+            self.tickets.borrow().len()
+        }
     }
 
     impl Dispatcher for TestDispatcher {
@@ -261,8 +291,11 @@ mod test {
 
     #[test]
     fn test_road_monitor() {
-        let dispatcher1 = Rc::new(TestDispatcher { id: 1, tickets: Default::default()});
-        let mut road_monitor: RoadMonitor<TestDispatcher> = RoadMonitor::from(123);
+        let dispatcher1 = Rc::new(TestDispatcher {
+            id: 1,
+            tickets: Default::default(),
+        });
+        let road_monitor: RoadMonitor<TestDispatcher> = RoadMonitor::from(123);
         road_monitor.add_ticket_dispatcher(dispatcher1.clone());
 
         let unix_car = Rc::new(Car::from("UN1X".to_owned()));
@@ -270,10 +303,80 @@ mod test {
         road_monitor.record_observation(unix_car.clone(), 8, 0, 60);
         road_monitor.record_observation(unix_car.clone(), 9, 45, 60);
 
-        let ticket = Ticket { car: unix_car.clone(), road_id: 123, mile1: 8, timestamp1: 0, mile2: 9, timestamp2: 45 };
+        let ticket = Ticket {
+            car: unix_car.clone(),
+            road_id: 123,
+            mile1: 8,
+            timestamp1: 0,
+            mile2: 9,
+            timestamp2: 45,
+        };
 
         assert_eq!(ticket.calculate_speed(), 8000);
 
         assert!(dispatcher1.has_ticket(&ticket));
+    }
+
+    #[test]
+    fn test_road_monitor_with_camera() {
+        let dispatcher1 = Rc::new(TestDispatcher {
+            id: 1,
+            tickets: Default::default(),
+        });
+        let road_monitor: Rc<RoadMonitor<TestDispatcher>> = Rc::new(RoadMonitor::from(123));
+
+        let unix_car = Rc::new(Car::from("UN1X".to_owned()));
+
+        let mut camera_a = Camera {
+            road_monitor: road_monitor.clone(),
+            mile: 8,
+            speed_limit: 60,
+        };
+
+        camera_a.observation(unix_car.clone(), 0);
+
+        let mut camera_b = Camera {
+            road_monitor: road_monitor.clone(),
+            mile: 9,
+            speed_limit: 60,
+        };
+
+        camera_b.observation(unix_car.clone(), 45);
+
+        road_monitor.add_ticket_dispatcher(dispatcher1.clone());
+
+        let ticket = Ticket {
+            car: unix_car.clone(),
+            road_id: 123,
+            mile1: 8,
+            timestamp1: 0,
+            mile2: 9,
+            timestamp2: 45,
+        };
+
+        assert_eq!(ticket.calculate_speed(), 8000);
+
+        assert!(dispatcher1.has_ticket(&ticket));
+    }
+    #[test]
+    fn test_no_duplicate_tickets() {
+        let dispatcher1 = Rc::new(TestDispatcher {
+            id: 1,
+            tickets: Default::default(),
+        });
+        let road_monitor: Rc<RoadMonitor<TestDispatcher>> = Rc::new(RoadMonitor::from(123));
+        road_monitor.add_ticket_dispatcher(dispatcher1.clone());
+
+        let unix_car = Rc::new(Car::from("UN1X".to_owned()));
+
+        road_monitor.record_observation(unix_car.clone(), 0, 0, 10);
+        road_monitor.record_observation(unix_car.clone(), 10, 60, 10);
+
+        assert_eq!(1, dispatcher1.count_tickets());
+
+        road_monitor.record_observation(unix_car.clone(), 20, 120, 10);
+        road_monitor.record_observation(unix_car.clone(), 30, 180, 10);
+
+        assert_eq!(1, dispatcher1.count_tickets());
     }
 }
