@@ -176,7 +176,7 @@ impl<D: Dispatcher> RoadMonitor<D> {
 
     fn add_ticket_dispatcher(&self, d: Rc<D>) {
         match self.dispatchers.lock().unwrap().entry(d.id()) {
-            Occupied(_) => todo!(),
+            Occupied(_) => panic!("dispatcher already present"),
             Vacant(v) => {
                 v.insert(d.clone());
             }
@@ -191,7 +191,7 @@ impl<D: Dispatcher> RoadMonitor<D> {
             Occupied(o) => {
                 o.remove();
             }
-            Vacant(_) => todo!(),
+            Vacant(_) => panic!("no dispatcher present"),
         }
     }
 }
